@@ -1,0 +1,7 @@
+domain,label,source,license,retrieved_at
+safe.example,0,offline_fixture,CC0-1.0,2026-10-10T00:00:00Z
+mail.safe.example,0,offline_fixture,CC0-1.0,2026-10-10T00:00:00Z
+plain.test,0,offline_fixture,CC0-1.0,2026-10-10T00:00:00Z
+malware.invalid,1,offline_fixture,CC0-1.0,2026-10-10T00:00:00Z
+login-phish.invalid,1,offline_fixture,CC0-1.0,2026-10-10T00:00:00Z
+secure-check.example,1,offline_fixture,CC0-1.0,2026-10-10T00:00:00Z

@@ -1,0 +1,48 @@
+name: Aura Model Dataset, Training and Benchmark
+
+on:
+  pull_request:
+    paths:
+      - 'tool/**'
+      - 'data/**'
+      - '.github/workflows/model-training.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'tool/**'
+      - 'data/**'
+      - '.github/workflows/model-training.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  model-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: tool/requirements-train.txt
+      - name: Install training and test dependencies
+        run: python -m pip install -r tool/requirements-train.txt
+      - name: Build dataset from commercially permitted sources
+        run: python tool/dataset/build_dataset.py --sources phishing_database
+      - name: Train model and write held-out metrics
+        run: python tool/train_max_aura_brain.py
+      - name: Benchmark warm and cold inference
+        run: python tool/bench_aura_brain.py
+      - name: Run golden tests
+        run: python -m pytest tool/test_aura_brain.py -q
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: aura-model-pipeline-reports
+          path: tool/reports/*
+          if-no-files-found: error
+          retention-days: 30
+      # CI artifacts are unsigned candidates; release signing stays manual with tool/sign_model.py.
