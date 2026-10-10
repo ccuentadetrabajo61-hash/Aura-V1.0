@@ -58,7 +58,11 @@ resolve_keystore() {
     temporary_files+=("$keystore_file")
     chmod 0600 "$keystore_file" 2>/dev/null ||
         fail "Could not secure the temporary Base64 keystore."
-    if ! printf '%s' "$AURA_KEYSTORE_BASE64" | base64 --decode > "$keystore_file" 2>/dev/null; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        if ! printf '%s' "$AURA_KEYSTORE_BASE64" | base64 -D > "$keystore_file" 2>/dev/null; then
+            fail "AURA_KEYSTORE_BASE64 is not valid Base64 keystore data."
+        fi
+    elif ! printf '%s' "$AURA_KEYSTORE_BASE64" | base64 --decode > "$keystore_file" 2>/dev/null; then
         fail "AURA_KEYSTORE_BASE64 is not valid Base64 keystore data."
     fi
     [[ -s "$keystore_file" ]] || fail "AURA_KEYSTORE_BASE64 decoded to an empty keystore."
