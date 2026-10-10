@@ -37,9 +37,19 @@ android {
         }
     }
 
+    signingConfigs {
+        release {
+            def keystorePath = System.getenv("AURA_KEYSTORE_PATH")
+            storeFile = keystorePath ? project.file(keystorePath).absoluteFile : null
+            storePassword = System.getenv("AURA_STORE_PASSWORD")
+            keyAlias = System.getenv("AURA_KEY_ALIAS")
+            keyPassword = System.getenv("AURA_KEY_PASSWORD")
+        }
+    }
+
     buildTypes {
         release {
-            signingConfig signingConfigs.debug
+            signingConfig signingConfigs.release
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
@@ -56,43 +66,12 @@ dependencies {
 
 def signingCertificateSha256 = { signingConfig ->
     def keystoreFile = signingConfig.storeFile
-    if (keystoreFile == null) {
-        throw new GradleException("No keystore configured for signing config '${signingConfig.name}'.")
-    }
-
     def storePassword = signingConfig.storePassword
     def keyAlias = signingConfig.keyAlias
-    def keyPassword = signingConfig.keyPassword
-
-    if (!keystoreFile.exists() && signingConfig.name == "debug") {
-        if (storePassword == null) storePassword = "android"
-        if (keyAlias == null) keyAlias = "androiddebugkey"
-        if (keyPassword == null) keyPassword = "android"
-
-        keystoreFile.parentFile.mkdirs()
-        def keytool = new File(System.getProperty("java.home"), "bin/keytool")
-        if (!keytool.isFile()) {
-            throw new GradleException("JDK keytool was not found at ${keytool}.")
-        }
-        exec {
-            executable keytool.absolutePath
-            args "-genkeypair", "-v",
-                "-keystore", keystoreFile.absolutePath,
-                "-storetype", "JKS",
-                "-storepass", storePassword,
-                "-alias", keyAlias,
-                "-keypass", keyPassword,
-                "-keyalg", "RSA",
-                "-keysize", "2048",
-                "-validity", "10000",
-                "-dname", "CN=Android Debug,O=Android,C=US"
-            standardOutput = new ByteArrayOutputStream()
-            errorOutput = new ByteArrayOutputStream()
-        }
-    }
-
-    if (!keystoreFile.isFile() || storePassword == null || keyAlias == null) {
-        throw new GradleException("Signing keystore or credentials are unavailable for '${signingConfig.name}'.")
+    if (keystoreFile == null || !keystoreFile.isFile() ||
+        storePassword == null || storePassword.trim().isEmpty() ||
+        keyAlias == null || keyAlias.trim().isEmpty()) {
+        return null
     }
 
     def keyStore = null
@@ -127,19 +106,56 @@ def signingCertificateSha256 = { signingConfig ->
 
 android.buildTypes.each { buildType ->
     def activeSigningConfig = buildType.signingConfig
-    if (activeSigningConfig == null && buildType.name == "debug") {
-        activeSigningConfig = android.signingConfigs.getByName("debug")
-    }
-    if (activeSigningConfig == null) {
-        throw new GradleException("No active signing config for '${buildType.name}'.")
-    }
-
-    def activeCertificateSha256 = signingCertificateSha256(activeSigningConfig)
+    def activeCertificateSha256 = activeSigningConfig == null
+        ? null
+        : signingCertificateSha256(activeSigningConfig)
     buildType.buildConfigField(
         "String",
         "AURA_ALLOWED_CERT_SHA256",
-        "\"${activeCertificateSha256}\"",
+        "\"${activeCertificateSha256 ?: ''}\"",
     )
+}
+
+def releaseSigningVariables = [
+    "AURA_KEYSTORE_PATH",
+    "AURA_STORE_PASSWORD",
+    "AURA_KEY_ALIAS",
+    "AURA_KEY_PASSWORD",
+]
+
+gradle.taskGraph.whenReady { taskGraph ->
+    def releaseSigningRequested = taskGraph.allTasks.any { task ->
+        task.project == project &&
+            (task.name == "printReleaseSigning" || task.name.toLowerCase().contains("release"))
+    }
+    if (releaseSigningRequested) {
+        def missingVariables = releaseSigningVariables.findAll {
+            def value = System.getenv(it)
+            value == null || value.trim().isEmpty()
+        }
+        if (!missingVariables.isEmpty()) {
+            throw new GradleException(
+                "Missing required release signing environment variable(s): ${missingVariables.join(', ')}"
+            )
+        }
+        def keystoreFile = android.signingConfigs.release.storeFile
+        if (keystoreFile == null || !keystoreFile.isFile()) {
+            throw new GradleException(
+                "AURA_KEYSTORE_PATH must point to an existing keystore file."
+            )
+        }
+    }
+}
+
+tasks.register("printReleaseSigning") {
+    group = "verification"
+    description = "Prints the configured release signing identity without exposing credentials."
+    doLast {
+        def releaseSigningConfig = android.buildTypes.getByName("release").signingConfig
+        println "STORE_FILE=${releaseSigningConfig.storeFile?.absolutePath ?: ''}"
+        println "KEY_ALIAS=${releaseSigningConfig.keyAlias ?: ''}"
+        println "IS_DEBUG_SIGNING=${releaseSigningConfig == android.signingConfigs.debug}"
+    }
 }
 
 flutter {

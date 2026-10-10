@@ -18,11 +18,11 @@ workflows:
         - pattern: 'main'
         - pattern: 'principal'
     scripts:
-      - name: Configure JDK 17 and build Android APK (Release)
+      - name: Configure JDK 17 and build Android App Bundle (Release)
         script: |
           set -euo pipefail
           cd "${CM_BUILD_DIR:?CM_BUILD_DIR is required}"
           bash tool/compile_aura.sh
     artifacts:
-      - build/app/outputs/flutter-apk/app-release.apk
+      - build/app/outputs/bundle/release/app-release.aab
       
