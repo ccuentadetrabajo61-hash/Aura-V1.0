@@ -8,6 +8,7 @@ workflows:
         - production_keys
       vars:
         PACKAGE_NAME: "com.aura.cyberdefense"
+        AURA_BUILD_FORMAT: "apk"
       # AURA_PUBLIC_KEY_ENV is injected by production_keys; store only the Base64 DER body there.
       flutter: stable
       java: 17
@@ -18,11 +19,45 @@ workflows:
         - pattern: 'main'
         - pattern: 'principal'
     scripts:
-      - name: Configure JDK 17 and build Android APK (Release)
+      - name: Resolve Codemagic keystore file variable
+        script: |
+          set -euo pipefail
+          if [[ -n "${AURA_KEYSTORE_FILE:-}" && -z "${AURA_KEYSTORE_PATH:-}" ]]; then
+            [[ -f "$AURA_KEYSTORE_FILE" ]] || {
+              printf '%s\n' '[AURA-PREFLIGHT][ERROR] AURA_KEYSTORE_FILE does not reference an existing file.' >&2
+              exit 1
+            }
+            [[ -n "${CM_ENV:-}" ]] || {
+              printf '%s\n' '[AURA-PREFLIGHT][ERROR] CM_ENV is unavailable for persisting AURA_KEYSTORE_PATH.' >&2
+              exit 1
+            }
+            printf 'AURA_KEYSTORE_PATH=%s\n' "$AURA_KEYSTORE_FILE" >> "$CM_ENV"
+          fi
+      - name: Preflight release signing variables
+        script: |
+          set -euo pipefail
+          missing=()
+          for variable in AURA_STORE_PASSWORD AURA_KEY_ALIAS AURA_KEY_PASSWORD; do
+            [[ -n "${!variable:-}" ]] || missing+=("$variable")
+          done
+          if [[ -z "${AURA_KEYSTORE_PATH:-}" && -z "${AURA_KEYSTORE_BASE64:-}" ]]; then
+            missing+=("AURA_KEYSTORE_PATH or AURA_KEYSTORE_BASE64")
+          fi
+          if ((${#missing[@]} > 0)); then
+            printf '[AURA-PREFLIGHT][ERROR] Configure required production_keys variables: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+      - name: Build Android Release artifact
         script: |
           set -euo pipefail
           cd "${CM_BUILD_DIR:?CM_BUILD_DIR is required}"
           bash tool/compile_aura.sh
+      - name: Verify Android Release artifact signer
+        script: |
+          set -euo pipefail
+          cd "${CM_BUILD_DIR:?CM_BUILD_DIR is required}"
+          bash tool/compile_aura.sh --verify-artifact
     artifacts:
-      - build/app/outputs/flutter-apk/app-release.apk
+      - build/app/outputs/flutter-apk/*.apk
+      - build/app/outputs/bundle/release/*.aab
       

@@ -2,6 +2,12 @@
 /tool/encrypt_model.dart
 /assets/model/aura_brain_model.enc
 /assets/model/aura_brain_model.sha256
+/data/raw/
+/data/splits/
+/data/aura_dataset.csv
+/data/dataset_manifest.json
+/tool/reports/
+.pytest_cache/
 **/*.tmp.json
 **/*.temp.json
 **/*.temporary.json
