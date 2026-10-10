@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Release builds produce an AAB by default; set AURA_BUILD_FORMAT=apk only when
+# the consumer expects build/app/outputs/flutter-apk/app-release.apk.
 set -euo pipefail
 
 log() {

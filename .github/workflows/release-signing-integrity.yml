@@ -42,6 +42,8 @@ jobs:
           fi
           printf 'flutter.sdk=%s\n' "$flutter_root" >> "$properties_tmp"
           mv "$properties_tmp" android/local.properties
+      - name: Resolve Flutter dependencies
+        run: flutter pub get
       - name: Require release signing variables
         working-directory: android
         shell: bash
@@ -89,3 +91,53 @@ jobs:
             printf '%s\n' 'Missing release block or debug signing reference found in it.' >&2
             exit 1
           fi
+
+  release-signing-positive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Configure Flutter SDK path for Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter_binary="$(command -v flutter)"
+          flutter_root="$(cd "$(dirname "$flutter_binary")/.." && pwd -P)"
+          properties_tmp="$(mktemp)"
+          if [[ -f android/local.properties ]]; then
+            awk -F= '$1 != "flutter.sdk" {print}' android/local.properties > "$properties_tmp"
+          fi
+          printf 'flutter.sdk=%s\n' "$flutter_root" >> "$properties_tmp"
+          mv "$properties_tmp" android/local.properties
+      - name: Resolve Flutter dependencies
+        run: flutter pub get
+      - name: Verify release signing with an ephemeral key
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AURA_KEYSTORE_PATH="$RUNNER_TEMP/aura-release-signing.jks"
+          export AURA_STORE_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+          export AURA_KEY_ALIAS='aura-release-ci'
+          export AURA_KEY_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+          trap 'rm -f "$AURA_KEYSTORE_PATH"' EXIT
+          echo "::add-mask::$AURA_STORE_PASSWORD"
+          echo "::add-mask::$AURA_KEY_PASSWORD"
+          keytool -genkeypair -noprompt \
+            -alias "$AURA_KEY_ALIAS" \
+            -keyalg RSA -keysize 2048 -validity 2 \
+            -keystore "$AURA_KEYSTORE_PATH" -storetype JKS \
+            -storepass "$AURA_STORE_PASSWORD" \
+            -keypass "$AURA_KEY_PASSWORD" \
+            -dname 'CN=Aura Ephemeral CI Release,O=Aura,C=US'
+          cd android
+          output="$(./gradlew :app:printReleaseSigning --console=plain)"
+          printf '%s\n' "$output"
+          grep -Fq "STORE_FILE=$AURA_KEYSTORE_PATH" <<< "$output"
+          grep -Fq "KEY_ALIAS=$AURA_KEY_ALIAS" <<< "$output"
+          grep -Fq 'IS_DEBUG_SIGNING=false' <<< "$output"
