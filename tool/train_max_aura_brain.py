@@ -4,12 +4,13 @@ import hashlib
 import json
 import math
 import os
-import re
 import tempfile
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import numpy as np
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.tree import _tree
 
@@ -27,9 +28,17 @@ SUSPICIOUS_TLDS = {
     "mov", "party", "review", "rest", "stream", "support", "tk", "top",
     "wang", "work", "xyz", "zip",
 }
-DOMAIN_COLUMNS = {"domain", "host", "hostname", "url", "fqdn", "requested_domain"}
-LABEL_COLUMNS = {"label", "class", "target", "is_malicious", "malicious", "threat"}
-SKIP_DIRS = {".git", ".dart_tool", ".gradle", ".venv", "build", "__pycache__", "venv"}
+DATASET_DIR = ROOT / "data"
+REPORTS_DIR = ROOT / "tool/reports"
+MODEL_OUTPUT = REPORTS_DIR / "aura_brain_model.json"
+METRICS_JSON = REPORTS_DIR / "metrics.json"
+METRICS_MARKDOWN = REPORTS_DIR / "metrics.md"
+EXPECTED_CLASSES = {0, 1}
+MIN_TEST_ROWS_PER_CLASS = 500
+
+
+def normalize_domain(value):
+    return value.strip().lower().rstrip(".")
 SEED_DATASET = [
     ("google.com", 0), ("github.com", 0), ("whatsapp.com", 0),
     ("amazon.com", 0), ("bancodevenezuela.com", 0), ("codemagic.io", 0),
@@ -44,17 +53,6 @@ SEED_DATASET = [
     ("91kazmslqo1029az.biz", 1), ("free-cleaner-android.gq", 1),
     ("p0wz9172mlxozq.tk", 1), ("get-unlocked-premium.fit", 1),
 ]
-
-
-def normalize_domain(value):
-    candidate = value.strip().lower()
-    if not candidate:
-        return ""
-    if "://" in candidate:
-        candidate = urlsplit(candidate).hostname or ""
-    else:
-        candidate = candidate.split("/", 1)[0].split(":", 1)[0]
-    return candidate.rstrip(".")
 
 
 def calculate_shannon_entropy(domain_string):
@@ -103,48 +101,116 @@ def extract_maximum_features(domain):
     ]
 
 
-def parse_label(value):
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "malicious", "malware", "threat", "dga", "bad"}:
-        return 1
-    if normalized in {"0", "false", "benign", "safe", "legitimate", "good"}:
-        return 0
-    return None
+def read_split(path):
+    if not path.is_file():
+        raise FileNotFoundError(f"Dataset split is missing: {path}")
+    rows = []
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        expected_header = ["domain", "label", "source", "license", "retrieved_at"]
+        if reader.fieldnames != expected_header:
+            raise ValueError(f"Unexpected dataset CSV schema in {path}: {reader.fieldnames}")
+        for row in reader:
+            domain = row["domain"].strip().lower()
+            if not domain or "." not in domain or row["label"] not in {"0", "1"}:
+                raise ValueError(f"Invalid dataset row in {path}: {row}")
+            rows.append((domain, int(row["label"])))
+    return rows
 
 
-def discover_csv_files(dataset_root):
-    dataset_root = Path(dataset_root)
-    if not dataset_root.exists():
-        return []
-    csv_files = []
-    for current_root, directory_names, file_names in os.walk(dataset_root):
-        directory_names[:] = sorted(name for name in directory_names if name not in SKIP_DIRS)
-        for file_name in file_names:
-            if file_name.lower().endswith(".csv"):
-                csv_files.append(Path(current_root) / file_name)
-    return sorted(csv_files)
+def evaluate_metrics(labels, predictions):
+    matrix = confusion_matrix(labels, predictions, labels=[0, 1])
+    true_negative, false_positive, false_negative, true_positive = matrix.ravel()
+    specificity_denominator = true_negative + false_positive
+    return {
+        "accuracy": float(accuracy_score(labels, predictions)),
+        "precision": float(precision_score(labels, predictions, zero_division=0)),
+        "recall": float(recall_score(labels, predictions, zero_division=0)),
+        "f1": float(f1_score(labels, predictions, zero_division=0)),
+        "false_positive_rate": (
+            float(false_positive / specificity_denominator)
+            if specificity_denominator
+            else 0.0
+        ),
+        "confusion_matrix": {
+            "labels": ["safe", "threat"],
+            "rows_actual_columns_predicted": matrix.tolist(),
+            "true_negative": int(true_negative),
+            "false_positive": int(false_positive),
+            "false_negative": int(false_negative),
+            "true_positive": int(true_positive),
+        },
+    }
 
 
-def read_csv_samples(csv_files, max_rows):
-    samples = []
-    for csv_path in csv_files:
-        with csv_path.open("r", encoding="utf-8-sig", newline="", errors="replace") as stream:
-            reader = csv.DictReader(stream)
-            if not reader.fieldnames:
-                continue
-            columns = {name.strip().lower(): name for name in reader.fieldnames if name}
-            domain_column = next((columns[name] for name in DOMAIN_COLUMNS if name in columns), None)
-            label_column = next((columns[name] for name in LABEL_COLUMNS if name in columns), None)
-            if domain_column is None or label_column is None:
-                continue
-            for row in reader:
-                domain = normalize_domain(row.get(domain_column) or "")
-                label = parse_label(row.get(label_column) or "")
-                if domain and "." in domain and label is not None:
-                    samples.append((domain, label))
-                    if max_rows and len(samples) >= max_rows:
-                        return samples
-    return samples
+def evaluate_serialized_node(node, features, depth=0):
+    if not isinstance(node, dict) or depth > 32:
+        raise ValueError("Invalid or too-deep serialized model node")
+    if node.get("type") == "leaf":
+        value = node.get("value")
+        if value not in (0, 1):
+            raise ValueError("Serialized leaf value must be binary")
+        return int(value)
+    feature_index = node.get("feature_index")
+    threshold = node.get("threshold")
+    if (
+        node.get("type") != "split"
+        or not isinstance(feature_index, int)
+        or feature_index < 0
+        or feature_index >= len(features)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(threshold)
+    ):
+        raise ValueError("Invalid serialized split node")
+    branch = "left" if features[feature_index] <= threshold else "right"
+    return evaluate_serialized_node(node.get(branch), features, depth + 1)
+
+
+def predict_serialized_model(model, domain):
+    trees = model.get("trees")
+    if not isinstance(trees, list) or not trees:
+        raise ValueError("Serialized model has no trees")
+    features = extract_maximum_features(domain)
+    votes = sum(evaluate_serialized_node(tree.get("root"), features) for tree in trees)
+    return votes / len(trees)
+
+
+def write_metrics(metrics):
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write(METRICS_JSON, json.dumps(metrics, indent=2, sort_keys=True) + "\n")
+    scores = metrics["test_metrics"]
+    matrix = scores["confusion_matrix"]
+    markdown = "\n".join(
+        [
+            "# Aura Random Forest Test Metrics",
+            "",
+            f"- Test rows: {metrics['test_rows']}",
+            f"- Test class counts: safe={metrics['test_class_counts']['safe']}, threat={metrics['test_class_counts']['threat']}",
+            f"- Accuracy: {scores['accuracy']:.6f}",
+            f"- Precision: {scores['precision']:.6f}",
+            f"- Recall: {scores['recall']:.6f}",
+            f"- F1: {scores['f1']:.6f}",
+            f"- False-positive rate: {scores['false_positive_rate']:.6f}",
+            "",
+            "## Confusion matrix",
+            "",
+            "| Actual \\ Predicted | Safe | Threat |",
+            "|---|---:|---:|",
+            f"| Safe | {matrix['true_negative']} | {matrix['false_positive']} |",
+            f"| Threat | {matrix['false_negative']} | {matrix['true_positive']} |",
+            "",
+            "## Training run",
+            "",
+            f"- Samples: {metrics['training_rows']}",
+            f"- Trees: {metrics['hyperparameters']['n_estimators']}",
+            f"- Maximum depth: {metrics['hyperparameters']['max_depth']}",
+            f"- Training time: {metrics['training_seconds']:.3f} s",
+            f"- Dataset manifest SHA-256: {metrics['dataset_manifest_sha256']}",
+            f"- Validation accuracy: {metrics['validation_metrics']['accuracy']:.6f}",
+            "",
+        ]
+    )
+    atomic_write(METRICS_MARKDOWN, markdown)
 
 
 def serialize_tree(estimator):
@@ -180,32 +246,51 @@ def atomic_write(path, content):
 def main():
     parser = argparse.ArgumentParser(description="Entrena el bosque local de Aura.")
     parser.add_argument(
-        "--dataset-root",
-        type=Path,
-        default=Path(os.environ.get("AURA_DATASET_DIR", ROOT / "data")),
-        help="Directorio recursivo de CSV con columnas de dominio y etiqueta.",
-    )
-    parser.add_argument(
-        "--max-csv-rows",
-        type=int,
-        default=0,
-        help="Límite opcional de filas CSV; 0 procesa todas las filas compatibles.",
+        "--allow-seed-only",
+        action="store_true",
+        help="Allow the documented 30-domain seed fallback when a qualified test split is unavailable.",
     )
     args = parser.parse_args()
-    if args.max_csv_rows < 0:
-        parser.error("--max-csv-rows debe ser 0 o mayor.")
+    try:
+        train_rows = read_split(DATASET_DIR / "splits/train.csv")
+        val_rows = read_split(DATASET_DIR / "splits/val.csv")
+        test_rows = read_split(DATASET_DIR / "splits/test.csv")
+    except FileNotFoundError as error:
+        if not args.allow_seed_only:
+            raise SystemExit(
+                f"{error}. Pass --allow-seed-only only for the documented seed fallback."
+            ) from error
+        train_rows, val_rows, test_rows = [], [], []
+    test_counts = {label: sum(row_label == label for _, row_label in test_rows) for label in EXPECTED_CLASSES}
+    inadequate_test = any(test_counts[label] < MIN_TEST_ROWS_PER_CLASS for label in EXPECTED_CLASSES)
+    if inadequate_test and not args.allow_seed_only:
+        raise SystemExit(
+            "Test split must contain at least 500 rows per class "
+            f"(safe={test_counts[0]}, threat={test_counts[1]}). "
+            "Rebuild from more licensed real data or pass --allow-seed-only for the documented seed fallback."
+        )
 
-    csv_files = discover_csv_files(args.dataset_root)
-    csv_samples = read_csv_samples(csv_files, args.max_csv_rows)
-    samples = SEED_DATASET + csv_samples
-    if len({label for _, label in samples}) != 2:
-        raise RuntimeError("El conjunto debe contener dominios benignos y maliciosos.")
+    using_seed_fallback = inadequate_test
+    if using_seed_fallback:
+        samples = list(SEED_DATASET)
+        training_rows = samples
+        evaluation_rows = samples
+        validation_rows = samples
+        print("WARNING: using the documented 30-domain seed-only fallback; metrics are not a real holdout evaluation.")
+    else:
+        training_rows = train_rows
+        evaluation_rows = test_rows
+        validation_rows = val_rows
 
-    features = np.asarray([extract_maximum_features(domain) for domain, _ in samples])
-    labels = np.asarray([label for _, label in samples], dtype=np.int64)
+    features = np.asarray([extract_maximum_features(domain) for domain, _ in training_rows])
+    labels = np.asarray([label for _, label in training_rows], dtype=np.int64)
+    evaluation_domains = [domain for domain, _ in evaluation_rows]
+    evaluation_labels = [label for _, label in evaluation_rows]
+    validation_domains = [domain for domain, _ in validation_rows]
+    validation_labels = [label for _, label in validation_rows]
     print(
-        f"Entrenando bosque local: 500 árboles, profundidad máxima 12, "
-        f"{len(csv_samples)} filas CSV y {len(SEED_DATASET)} muestras base."
+        f"Training Aura forest: 500 trees, max_depth=12, "
+        f"train={len(training_rows)}, val={len(val_rows)}, test={len(test_rows)}."
     )
     forest = RandomForestClassifier(
         n_estimators=500,
@@ -214,15 +299,28 @@ def main():
         random_state=42,
         class_weight="balanced_subsample",
     )
+    training_started = time.perf_counter()
     forest.fit(features, labels)
+    training_seconds = time.perf_counter() - training_started
+
+    evaluation_features = np.asarray(
+        [extract_maximum_features(domain) for domain in evaluation_domains]
+    )
+    predictions = forest.predict(evaluation_features).astype(int).tolist()
+    test_metrics = evaluate_metrics(evaluation_labels, predictions)
+    validation_features = np.asarray(
+        [extract_maximum_features(domain) for domain in validation_domains]
+    )
+    validation_predictions = forest.predict(validation_features).astype(int).tolist()
+    validation_metrics = evaluate_metrics(validation_labels, validation_predictions)
 
     model = {
         "model_name": "Aura Lexical Threat Forest",
         "model_version": "3.0.0",
         "model_type": "random_forest",
-        "training_status": "heuristic_seed_with_csv" if csv_samples else "heuristic_seed",
-        "training_samples": len(samples),
-        "csv_files": [str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path) for path in csv_files],
+        "training_status": "heuristic_seed" if using_seed_fallback else "heuristic_seed_with_csv",
+        "training_samples": len(training_rows),
+        "csv_files": [str((DATASET_DIR / "splits/train.csv").relative_to(ROOT))],
         "training_config": {
             "n_estimators": 500,
             "max_depth": 12,
@@ -237,13 +335,41 @@ def main():
         raise RuntimeError("El bosque serializado no contiene exactamente 500 árboles.")
 
     json_bytes = (json.dumps(model, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-    atomic_write(ROOT / "assets/model/aura_brain_model.json", json_bytes.decode("utf-8"))
-    digest = hashlib.sha256(json_bytes).hexdigest()
-    atomic_write(
-        ROOT / "assets/model/aura_brain_model.json.sha256",
-        digest + "\n",
-    )
-    print("Modelo JSON y digest SHA-256 generados; se serializaron 500 árboles.")
+    atomic_write(MODEL_OUTPUT, json_bytes.decode("utf-8"))
+    manifest_path = DATASET_DIR / "dataset_manifest.json"
+    if not manifest_path.is_file() and not using_seed_fallback:
+        raise FileNotFoundError(f"Dataset manifest is missing: {manifest_path}")
+    manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest() if manifest_path.is_file() else "seed-only-no-manifest"
+    metrics = {
+        "metrics_version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "evaluation_mode": "seed-only-not-a-holdout" if using_seed_fallback else "stratified-test-split",
+        "training_rows": len(training_rows),
+        "validation_rows": len(validation_rows),
+        "test_rows": len(evaluation_rows),
+        "test_class_counts": {
+            "safe": sum(label == 0 for label in evaluation_labels),
+            "threat": sum(label == 1 for label in evaluation_labels),
+        },
+        "hyperparameters": {
+            "n_estimators": 500,
+            "max_depth": 12,
+            "n_jobs": -1,
+            "random_state": 42,
+            "class_weight": "balanced_subsample",
+            "feature_order": FEATURE_ORDER,
+        },
+        "training_seconds": training_seconds,
+        "dataset_manifest_sha256": manifest_digest,
+        "metrics_model_file": str(MODEL_OUTPUT.relative_to(ROOT)),
+        "validation_metrics": validation_metrics,
+        "test_metrics": test_metrics,
+    }
+    write_metrics(metrics)
+    print(f"MODEL_CANDIDATE={MODEL_OUTPUT.relative_to(ROOT)}")
+    print(f"METRICS_JSON={METRICS_JSON.relative_to(ROOT)}")
+    print(f"METRICS_MARKDOWN={METRICS_MARKDOWN.relative_to(ROOT)}")
+    print("Model candidate and metrics generated; tracked assets/model files were not modified.")
 
 
 if __name__ == "__main__":
